@@ -1,86 +1,100 @@
-
+import json
 import re
 
 from langchain.chat_models import ChatOpenAI
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    HumanMessagePromptTemplate,
-)
+from langchain.prompts.chat import ChatPromptTemplate, HumanMessagePromptTemplate
 
 template = """
 You are a cartoon creator.
 
-You will be given a short scenario, you must split it in 6 parts.
-Each part will be a different cartoon panel.
-For each cartoon panel, you will write a description of it with:
- - the characters in the panel, they must be described precisely each time
- - the background of the panel
-The description should be only word or group of word delimited by a comma, no sentence.
-Always use the characters descriptions instead of their name in the cartoon panel description.
-You can not use the same description twice.
-You will also write the text of the panel.
-The text should not be more than 2 small sentences.
-Each sentence should start by the character name
+Return ONLY valid JSON in this shape:
+{"panels":[{"number":1,"description":"comma-separated visual description","text":"short dialogue"}]}
 
-Example input:
-Characters: Adrien is a guy with blond hair wearing glasses. Vincent is a guy with black hair wearing a hat.
-Adrien and vincent want to start a new product, and they create it in one night before presenting it to the board.
+Create six panels from the scenario. Repeat the complete physical description of every visible character in each panel. Keep text short. Do not use markdown fences or commentary.
 
-Example output:
-
-# Panel 1
-description: 2 guys, a blond hair guy wearing glasses, a dark hair guy wearing hat, sitting at the office, with computers
-text:
-```
-Vincent: I think Generative AI are the future of the company.
-Adrien: Let's create a new product with it.
-```
-# end
-
-Short Scenario:
+Scenario:
 {scenario}
-
-Split the scenario in 6 parts:
-"
 """
 
+
 def generate_panels(scenario):
-    model = ChatOpenAI(model_name='gpt-4')
+    model = ChatOpenAI(model_name="gpt-4")
+    prompt = ChatPromptTemplate.from_messages([
+        HumanMessagePromptTemplate.from_template(template)
+    ])
+    result = model(prompt.format_messages(scenario=scenario))
+    panels = extract_panel_info(result.content)
+    if not panels:
+        raise ValueError("The model returned no valid panels.")
+    return panels
 
-    human_message_prompt = HumanMessagePromptTemplate.from_template(template)
 
-    chat_prompt = ChatPromptTemplate.from_messages([human_message_prompt])
+def _normalize_panels(value):
+    if isinstance(value, dict):
+        value = value.get("panels", [])
+    if not isinstance(value, list):
+        return []
 
-    chat_prompt.format_messages(scenario=scenario)
+    panels = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if not description:
+            continue
+        number = item.get("number", index)
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            number = index
+        panels.append({
+            "number": number,
+            "description": description,
+            "text": text,
+        })
+    return panels
 
-    result = model(chat_prompt.format_messages(scenario=scenario))
-
-    print(result.content)
-
-    return extract_panel_info(result.content)
 
 def extract_panel_info(text):
-    panel_info_list = []
-    panel_blocks = text.split('# Panel')
+    """Parse JSON first, then support the legacy markdown format as a safe fallback."""
+    raw = text.strip()
 
-    for block in panel_blocks:
-        if block.strip() != '':
-            panel_info = {}
-            
-            # Extracting panel number
-            panel_number = re.search(r'\d+', block)
-            if panel_number is not None:
-                panel_info['number'] = panel_number.group()
-            
-            # Extracting panel description
-            panel_description = re.search(r'description: (.+)', block)
-            if panel_description is not None:
-                panel_info['description'] = panel_description.group(1)
-            
-            # Extracting panel text
-            panel_text = re.search(r'text:\n```\n(.+)\n```', block, re.DOTALL)
-            if panel_text is not None:
-                panel_info['text'] = panel_text.group(1)
-            
-            panel_info_list.append(panel_info)
-    return panel_info_list
+    candidates = [raw]
+    fenced = re.search(r"\x60\x60\x60(?:json)?\s*(.*?)\s*\x60\x60\x60", raw, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidates.insert(0, fenced.group(1))
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            panels = _normalize_panels(json.loads(candidate))
+            if panels:
+                return panels
+        except json.JSONDecodeError:
+            pass
+
+    legacy = []
+    blocks = re.split(r"(?im)^\s*#\s*Panel\s+", raw)
+    for index, block in enumerate(blocks, start=1):
+        if not block.strip():
+            continue
+        number_match = re.match(r"(\d+)", block.strip())
+        description_match = re.search(r"(?im)^\s*description:\s*(.+)$", block)
+        text_match = re.search(
+            r"(?is)^\s*text:\s*(?:\x60\x60\x60(?:text)?\s*)?(.*?)(?:\x60\x60\x60|$)",
+            block,
+        )
+        description = description_match.group(1).strip() if description_match else ""
+        panel_text = text_match.group(1).strip() if text_match else ""
+        if description:
+            legacy.append({
+                "number": int(number_match.group(1)) if number_match else index,
+                "description": description,
+                "text": panel_text,
+            })
+    return legacy
